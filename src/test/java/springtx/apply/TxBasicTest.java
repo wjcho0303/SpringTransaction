@@ -18,6 +18,7 @@ public class TxBasicTest {
     @Autowired BasicService basicService;
 
     @Test
+    @Transactional()
     void proxyCheck() {
         log.info("aop class = {}", basicService.getClass());
         Assertions.assertThat(AopUtils.isAopProxy(basicService)).isTrue();
