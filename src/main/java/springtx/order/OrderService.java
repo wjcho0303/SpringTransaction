@@ -24,6 +24,7 @@ public class OrderService {
         }
         else if (order.getOrderStatus().equals("잔고부족")) {
             log.info("잔고 부족 예외 발생");
+            order.setPayStatus("대기");
             throw new NotEnoughMoneyException("잔고가 부족합니다.");
         }
         else {
