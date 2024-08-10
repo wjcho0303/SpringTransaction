@@ -1,0 +1,171 @@
+- Spring Data JPA 예제와 트레이드 오프
+Spring Data JPA 예제에서, ItemService는 ItemRepository라는 인터페이스를 의존하였고,
+이 ItemRepository는 JpaItemRepositoryV2를 구현체로 두었다.
+이 구현체는 SpringDataJpaItemRepository라는 인터페이스를 주입 받아 사실상 의존하고 있었다.
+결과적으로 런타임 시 ItemService는 JpaItemRepositoryV2를 의존하고,
+V2는 동적으로 생성된 프록시 SpringDataJpaItemRepository의 구현체에 의존하는 그림이 나왔다.
+
+하지만 이러한 구조를 만들기 위해 중간에 어댑터가 들어가면 전체 구조가 너무 복잡해지고,
+사용해야 할 클래스도 많아지는 단점이 있다. 물론 ItemService의 유지보수성을 수월하게 하고
+DI, OCP 원칙도 지킬 수 있다는 좋은 점도 있지만 구조가 복잡해지는 단점도 있는 것이다.
+
+만약 그냥 ItemService가 SpringDataJpaItemRepository에 의존하게 했다면 어떻게 될까?
+런타임 시에 ItemService가 직접 동적으로 생성된 프록시 SpringDataJpaItemRepository의 구현체에 의존하게 될 것이다.
+
+두 가지 구조 중에 무엇이 더 좋을까? 정답은 없다. 결국 상황에 따라 갈리는 문제이다.
+추상화를 도입하는 것이 언제나 좋은 선택인 것은 아니라는 것이다.
+
+프로젝트의 규모가 크지 않고 확장성을 고려할 필요가 없을 때는 굳이 추상화를 도입해서 계층 구조를 더 복잡하게 만들 필요가 없다.
+반면, 프로젝트 규모가 크거나 확장성을 고려해야 할 때는 추상화를 도입하는 것이 더 좋을 수도 있다.
+
+좋은 개발자는 이러한 선택을 잘 하여 결과적으로 효율적인 개발 환경을 만들어가는 사람이라고 할 수 있다.
+
+
+
+- 실용적인 구조 만들어 보기: ItemServiceV2
+db2-querydsl 브랜치에서 다루었던 Querydsl을 사용한 RepositoryV3는 Spring Data JPA 방식이 아닌, 순수 JPA 방식을 사용했었다.
+하지만 사실 Spring Data JPA와 Querydsl을 같이 사용할 수도 있다.
+
+이 때는 ItemService에서 Spring Data JPA를 상속 받는 ItemRepositoryV2 인터페이스와,
+Querydsl 동적 쿼리가 담긴 ItemQueryRepositoryV2 클래스를 모두 DI 받는다.
+기본 CRUD와 단순 조회는 ItemRepositoryV2의 메서드를 호출하고, 복잡한 동적 쿼리는 ItemQueryRepositoryV2의 메서드를 호출하는 것이다.
+
+    @Repository
+    public interface ItemRepositoryV2 extends JpaRepository<Item, Long> {
+    }
+    
+    @Repository
+    public class ItemQueryRepositoryV2 {
+
+        private final JPAQueryFactory query;
+
+        public ItemQueryRepositoryV2(EntityManager em) {
+            this.query = new JPAQueryFactory(em);
+        }
+
+        public List<Item> findAll(ItemSearchCond cond) {
+            return query
+                    .select(item)
+                    .from(item)
+                    .where(likeItemName(cond.getItemName()), maxPrice(cond.getMaxPrice()))
+                    .fetch();
+        }
+
+        private BooleanExpression likeItemName(String itemName) {
+            if (StringUtils.hasText(itemName)) {
+                return item.itemName.like("%"+itemName+"%");
+            }
+            return null;
+        }
+
+        private BooleanExpression maxPrice(Integer maxPrice) {
+            if (maxPrice != null) {
+                return item.price.loe(maxPrice);
+            }
+            return null;
+        }
+    }
+
+    @Service
+    @Transactional
+    @RequiredArgsConstructor
+    public class ItemServiceV2 implements ItemService {
+
+        private final ItemRepositoryV2 itemRepositoryV2;
+        private final ItemQueryRepositoryV2 itemQueryRepositoryV2;
+
+        @Override
+        public Item save(Item item) {
+            return itemRepositoryV2.save(item);
+        }
+    
+        @Override
+        public void update(Long itemId, ItemUpdateDto updateParam) {
+            Item foundItem = itemRepositoryV2.findById(itemId).orElseThrow();
+            foundItem.setItemName(updateParam.getItemName());
+            foundItem.setPrice(updateParam.getPrice());
+            foundItem.setQuantity(updateParam.getQuantity());
+        }
+
+        @Override
+        public Optional<Item> findById(Long id) {
+            return itemRepositoryV2.findById(id);
+        }
+
+        @Override
+        public List<Item> findItems(ItemSearchCond cond) {
+            return itemQueryRepositoryV2.findAll(cond);
+        }
+    }
+
+    @Configuration
+    @RequiredArgsConstructor
+    public class V2Config {
+        private final EntityManager em;
+        private final ItemRepositoryV2 itemRepositoryV2;
+
+        @Bean
+        public ItemRepository itemRepository() {
+            return new JpaItemRepositoryV3(em);
+        }
+
+        @Bean
+        public ItemQueryRepositoryV2 itemQueryRepositoryV2() {
+            return new ItemQueryRepositoryV2(em);
+        }
+
+        @Bean
+        public ItemService itemService() {
+            return new ItemServiceV2(itemRepositoryV2, itemQueryRepositoryV2());
+        }
+    }
+
+    @Import(V2Config.class)
+
+참고로, V2Config에 ItemRepository를 남겨둔 이유는 TestDataInit 클래스에서 사용하고 있기 때문이다.
+현재 논의와 관련된 부분은 ItemQueryRepositoryV2와 ItemServiceV2 빈 등록 부분이다.
+update 메서드의 경우에는 JPA의 변경감지 기능을 활용하여 setter를 이용하여 로직을 작성한다.
+물론 현업에서는 롬복에서 제공하는 setter가 아닌, 별도의 변경 메서드를 정의하는 것이 권장되기도 한다.
+
+참고로, Spring Data JPA 레포지토리는 스프링이 자동으로 컨테이너에 빈으로 등록해주기 때문에 Config에서 빈으로 등록할 필요가 없다.
+그 대신 ItemServiceV2에 주입해주기는 해야 한다.
+
+이러한 구조는 작은 규모의 프로젝트, 구현할 시간이 많이 주어지지 않은 급한 프로젝트에서는 쓸만한 구조이다.
+그러나 프로젝트의 규모가 클 것으로 예상될 경우에는 이러한 구조는 많은 코드를 변경할 위험이 있으므로
+상황에 맞게 사용하도록 하자.
+
+
+
+- 다양한 데이터 접근 기술 조합하기
+JdbcTemplate과 MyBatis는 SQL을 직접 작성해야 하는 단점이 있지만 기술이 단순하기 때문에 SQL에 익숙한 개발자라면 금방 적응할 수 있다.
+반면, JPA, Spring Data JPA, QueryDSL 같은 기술들은 개발 생산성을 혁신할 수 있지만 학습 곡선이 높기 때문에 이런 부분을 감안해야 하며, QueryDSL이 동적 쿼리를 깔끔하게 작성할 수 있게 해주기는 하지만 복잡한 쿼리를 작성하기에는 한계가 있다.
+
+강사가 추천하는 방향은 JPA, Spring Data JPA, Querydsl을 기본으로 하되,
+복잡한 쿼리의 경우 JdbcTemplate이나 MyBatis를 그때그때에만 사용하는 것이다.
+
+실제로, 프로젝트마다 다르기는 하겠지만 실무에서 복잡한 쿼리는 전체 쿼리의 5% 정도밖에 차지 하지 않으므로
+ORM 계열을 사용하면 개발 생산성이 증가한다.
+
+어떤 쿼리 작성 기술을 사용하냐에 따라 트랜잭션 매니저도 달라진다.
+JPA 계열을 사용하면 JpaTransactionManager를 빈으로 등록하고, 
+SQLMapper 계열을 사용하면 내부에서 JDBC를 직접 사용해야 하기 때문에 DataSourceTransactionManager를 빈으로 등록한다.
+
+그렇다면 JPA와 SQL Mapper를 함께 사용하면 트랜잭션 매니저가 다르기 때문에 서로 충돌나는 거 아닐까 걱정될 수 있다.
+하지만 이러한 걱정은 하지 않아도 된다. 왜냐하면 JPA 기술도 결국 내부에서는 DataSource와 JDBC Connection을 사용하기 때문이다.
+그리고 실제로 JpaTransactionManager는 놀랍게도 DataSourceTransactionManager가 제공하는 기능도 대부분 제공한다.
+결과적으로, JpaTransactionManager 하나만 스프링 빈에 등록해주면 JPA와 JdbcTemplate, MyBatis의 DB 접근 메서드들을
+하나의 비즈니스 로직, 즉 하나의 트랜잭션 내에 묶어서 사용할 수 있는 것이다.
+
+물론 주의해야 할 점이 있다. 
+JPA와 JdbcTemplate을 함께 사용할 경우, JPA의 flush 타이밍에 주의해야 한다.
+JPA는 데이터를 변경하면 변경 사항을 즉시 DB에 반영하지 않고, 트랜잭션이 commit 되어야만 변경사항을 DB에 반영한다.
+그렇기 때문에 하나의 트랜잭션 안에서 JPA와 JdbcTemplate를 섞어 쓸 경우
+JdbcTemplate에서 JPA에 의해 변경되었다고 생각했던 데이터가 사실은 변경이 일어나지 않은 데이터를 읽어버리는 문제가 발생한다.
+
+이 문제를 해결하기 위해, JPA 호출이 끝난 시점에 flush를 해준 후에 JdbcTemplate을 적용해주어야 한다.
+    * 트랜잭션 시작;
+    * JPA 메서드;
+    * em.flush();
+    * Jdbc 메서드;
+    * 트랜잭션 끝;
+
