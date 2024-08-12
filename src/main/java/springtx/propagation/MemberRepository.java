@@ -3,6 +3,7 @@ package springtx.propagation;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
 
 import javax.persistence.EntityManager;
 import java.util.Optional;
@@ -13,6 +14,7 @@ import java.util.Optional;
 public class MemberRepository {
     private final EntityManager em;
 
+    @Transactional
     public void save(Member member) {
         log.info("member 저장");
         em.persist(member);
