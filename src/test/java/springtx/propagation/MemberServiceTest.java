@@ -47,4 +47,20 @@ class MemberServiceTest {
         assertThat(memberRepository.findByUsername(username)).isNotEmpty();
         assertThat(logRepository.findByMessage(username)).isEmpty();
     }
+
+
+    /**
+     * memberService        @Transactional: ON
+     * memberRepository     @Transactional: OFF
+     * logRepository        @Transactional: OFF
+     */
+    @Test
+    void singleTx() {
+        String username = "singleTx";
+
+        memberService.joinV1(username);
+
+        assertThat(memberRepository.findByUsername(username)).isNotEmpty();
+        assertThat(logRepository.findByMessage(username)).isNotEmpty();
+    }
 }
