@@ -34,9 +34,10 @@ public class MemberService {
     /**
      * joinV1()과 같은 기능을 수행
      * DB 로그 저장 시 예외가 발생하면 예외를 복구한다.
-     * 현재 별도의 트랜잭션은 설정하지 않는다.
+     * @Transactional 어노테이션 설정
      * @param username
      */
+    @Transactional
     public void joinV2(String username) {
         Member member = new Member(username);
         Log logMessage = new Log(username);
