@@ -1,0 +1,542 @@
+- 트랜잭션 전파 예제 프로젝트
+회원을 등록하고 조회하되, 회원에 대한 변경 이력을 추적할 수 있도록 회원 데이터가 변경될 때 
+변경 이력을 DB LOG 테이블에 남겨야 한다. 여기서는 예제를 단순화 하기 위해 회원 등록 시에만 LOG 테이블에 남기도록 하자.
+
+테스트 예제에 필요한 관련 코드들은 다음과 같다: Member, MemberRepository, Log, LogRepository, MemberService
+
+@Entity
+@Getter
+@Setter
+@NoArgsConstructor
+public class Member {
+    @Id
+    @GeneratedValue
+    private Long id;
+
+    private String username;
+
+    public Member(String username) {
+        this.username = username;
+    }
+}
+
+
+@Repository
+@Slf4j
+@RequiredArgsConstructor
+public class MemberRepository {
+    private final EntityManager em;
+
+    @Transactional
+    public void save(Member member) {
+        log.info("member 저장");
+        em.persist(member);
+    }
+
+    public Optional<Member> findByUsername(String username) {
+        return em.createQuery("select m from Member m where m.username = :username", Member.class)
+                .setParameter("username", username)
+                .getResultList().stream().findAny();
+    }
+}
+
+
+@Entity
+@Getter
+@Setter
+@NoArgsConstructor
+public class Log {
+    @Id
+    @GeneratedValue
+    private Long id;
+
+    private String message;
+
+    public Log(String message) {
+        this.message = message;
+    }
+}
+
+@Repository
+@Slf4j
+@RequiredArgsConstructor
+public class LogRepository {
+
+    private final EntityManager em;
+
+    @Transactional
+    public void save(Log logMessage) {
+        log.info("log 저장");
+        em.persist(logMessage);
+
+        if (logMessage.getMessage().contains("로그예외")) {
+            log.info("log 저장 시 예외 발생");
+            throw new RuntimeException("예외 발생");
+        }
+    }
+
+    public Optional<Log> findByMessage(String message) {
+        return em.createQuery("select l from Log l where l.message = :message", Log.class)
+                .setParameter("message", message)
+                .getResultList().stream().findAny();
+    }
+
+}
+
+
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class MemberService {
+    private final MemberRepository memberRepository;
+    private final LogRepository logRepository;
+
+    /**
+     * 회원과 DB 로그를 함께 남기는 비즈니스 로직
+     * 현재 별도의 트랜잭션은 설정하지 않는다.
+     * @param username
+     */
+    public void joinV1(String username) {
+        Member member = new Member(username);
+        Log logMessage = new Log(username);
+
+        log.info("== memberRepository 호출 시작 ==");
+        memberRepository.save(member);
+        log.info("== memberRepository 호출 종료 ==");
+
+        log.info("== logRepository 호출 시작 ==");
+        logRepository.save(logMessage);
+        log.info("== logRepository 호출 종료 ==");
+    }
+
+    /**
+     * joinV1()과 같은 기능을 수행
+     * DB 로그 저장 시 예외가 발생하면 예외를 복구한다.
+     * 현재 별도의 트랜잭션은 설정하지 않는다.
+     * @param username
+     */
+    public void joinV2(String username) {
+        Member member = new Member(username);
+        Log logMessage = new Log(username);
+
+        log.info("== memberRepository 호출 시작 ==");
+        memberRepository.save(member);
+        log.info("== memberRepository 호출 종료 ==");
+
+        log.info("== logRepository 호출 시작 ==");
+        try {
+            logRepository.save(logMessage);
+        } catch (RuntimeException e) {
+            log.info("log 저장에 실패했습니다. logMessage = {}", logMessage.getMessage());
+            log.info("정상 흐름 변환");
+        }
+        log.info("== logRepository 호출 종료 ==");
+    }
+}
+
+joinV1은 예외를 처리하지 않기 때문에 memberRepository.save(member)와 logRepository.save(logMessage) 중
+하나라도 예외가 발생하면 예외가 상위로 전파되면서 메서드가 중단된다. 
+예외가 발생할 경우 Member와 Log 둘 중 하나만 저장될 수 있고, 트랜잭션 설정이 없다면 데이터 일관성이 깨질 수 있다.
+
+joinV2는 logRepository.save(logMessage)에서 예외가 발생할 수 있는 경우를 대비해 예외 처리를 하고 있다.
+logRepository.save에서 예외가 발생하면, 이를 캐치하여 로그 메시지를 출력하고, 프로그램의 흐름을 정상적으로 유지한다.
+즉, 로그 저장에 실패하더라도 Member는 정상적으로 저장되며, 예외로 인해 흐름이 중단되지 않게 한다.
+
+두 메서드 모두 트랜잭션 설정이 되어 있지 않아 예외 발생 시 Member 테이블과 Log 테이블의 데이터 일관성 문제가 발생한다.
+
+
+
+- 서비스 계층에 트랜잭션이 없을 때 - 커밋
+@SpringBootTest
+@Slf4j
+class MemberServiceTest {
+    @Autowired MemberService memberService;
+    @Autowired MemberRepository memberRepository;
+    @Autowired LogRepository logRepository;
+
+
+    /**
+     * memberService	@Transactional: OFF
+     * memberRepository	@Transactional: ON
+     * logRepository	@Transactional: ON
+     */
+    @Test
+    void outerTxOff_success() {
+        String username = "outerTxOff_success";
+
+        memberService.joinV1(username);
+
+        assertThat(memberRepository.findByUsername(username)).isNotEmpty();
+        assertThat(logRepository.findByMessage(username)).isNotEmpty();
+    }
+}
+
+이 테스트는 Service 계층에는 @Transactional이 없고, Repository 계층에 @Transactional이 있는 경우이다.
+
+
+흐름은 아래와 같다: 
+1) MemberService에서 MemberRepository를 호출한다. MemberRepository에는 @Transactional이 있으므로 
+   트랜잭션 AOP가 작동한다. 여기서 트랜잭션 매니저를 통해 트랜잭션을 시작한다. 이렇게 시작한 트랜잭션을 트랜잭션 B라고 부르자.
+   트랜잭션 매니저에 트랜잭션을 요청하면 DataSource를 통해 Connection A를 획득하고,
+   이 Connection A를 수동 커밋 모드로 변경해서 트랜잭션을 시작한다.
+
+2) MemberRepository는 JPA를 통해 Member를 저장하는데, 이때 JPA는 트랜잭션이 시작된 Connection A를 사용하여 회원을 저장한다.
+
+3) MemberRepository가 정상 응답을 반환했기 때문에 트랜잭션 AOP는 트랜잭션 매니저에 커밋을 요청한다.
+
+4) 트랜잭션 매니저는 Connection A를 통해 물리 트랜잭션을 커밋한다.
+   물론 이 시점에 이전에 설명한 신규 트랜잭션 여부와 rollbackOnly 여부 모두 체크한다.
+
+이렇게 해서 MemberRepository와 관련된 모든 데이터는 정상 커밋되고, 트랜잭션 B는 완전히 종료된다.
+이후에 LogRepository를 통해서도 위 과정과 유사하게 트랜잭션 C를 시작하고 정상 커밋한다.
+결과적으로 둘 다 커밋되고, Member와 Log 모두 안전하게 저장된다.
+
+
+* 참고
+@Transcational 과 @Transactional(propagation = Propagation.REQUIRED)는 같다.
+
+
+
+- 서비스 계층에 트랜잭션이 없을 때 - 롤백
+이번에는 LogRepository에서 예외를 발생시켜보는 예제이다.
+
+    /**
+     * memberService	@Transactional: OFF
+     * memberRepository	@Transactional: ON
+     * logRepository	@Transactional: ON
+     */
+    @Test
+    void outerTxOff_fail() {
+        String username = "로그예외_outerTxOff_fail";
+
+        assertThatThrownBy(() -> memberService.joinV1(username))
+                .isInstanceOf(RuntimeException.class);
+
+        assertThat(memberRepository.findByUsername(username)).isNotEmpty();
+        assertThat(logRepository.findByMessage(username)).isEmpty();
+    }
+
+앞에서 LogRepository의 save() 메서드에는 다음과 같은 조건문이 있었다:
+    if (logMessage.getMessage().contains("로그예외")) {
+        log.info("log 저장 시 예외 발생");
+        throw new RuntimeException("예외 발생");
+    }
+"로그예외"라는 message 필드값이 문자열을 포함하고 있을 경우 RuntimeException을 던지게 되어 있다.
+
+그리고, joinV1 메서드는 RuntimeException을 catch 하지 않기 때문에 assertThatThrownBy에 의해 RuntimeException이 확인된다.
+LogRepository에서 예외가 발생하면 Log가 저장되지 않으므로 findByMessage를 했을 때 isEmpty()가 true여야 테스트에 통과하게 된다.
+
+
+흐름은 다음과 같다:
+MemberService에서 MemberRepository를 호출하는 부분은 앞의 경우와 같으며, 회원 데이터는 DB에 정상 반영된다.
+그런데 MemberService에서 LogRepository를 호출하는데, 이때 "로그예외" 문자열이 포함된 이름을 전달한다.
+이 과정에서 생성된 트랜잭션을 트랜잭션 C라고 부르자.
+
+1) LogRepository는 트랜잭션 C와 관련된 Connection B를 사용한다.
+
+2) message 필드값에 "로그예외" 문자열이 포함되었기 때문에 LogRepository의 save() 메서드에서 RuntimeException이 발생한다.
+
+3) 트랜잭션 AOP가 LogRepository에서 던져진 RuntimeException을 받게 된다.
+
+4) 트랜잭션 AOP가 트랜잭션 매니저에 롤백을 호출한다.
+
+5) 트랜잭션 매니저는 트랜잭션 C가 신규 트랜잭션이므로 물리 롤백을 호출한다.
+(참고: 트랜잭션 AOP도 결국 내부에서는 트랜잭션 매니저를 사용하게 된다.)
+
+이번 테스트 코드 사례에서는 Member는 저장되지만 Log는 롤백되어 저장되지 못한다. 
+따라서 데이터 정합성에 문제가 발생할 수 있다. 이 문제를 해결하기 위해서는 둘을 하나의 트랜잭션에 묶어서 처리해야 한다.
+
+
+
+- MemberService에만 트랜잭션을 사용하여 단일 트랜잭션으로 묶는 경우 (브랜치명: tx-propagation-example2)
+먼저, MemberService의 jounV1 메서드에 @Transactional을 달아주고 Repository에 달려있던 @Transactional을 제거한다.
+그리고 아래와 같은 테스트 코드를 작성한다.
+
+    /**
+     * memberService        @Transactional: ON
+     * memberRepository     @Transactional: OFF
+     * logRepository        @Transactional: OFF
+     */
+    @Test
+    void singleTx() {
+        String username = "singleTx";
+
+        memberService.joinV1(username);
+
+        assertThat(memberRepository.findByUsername(username)).isNotEmpty();
+        assertThat(logRepository.findByMessage(username)).isNotEmpty();
+    }
+
+이렇게 하면 MemberService의 joinV1 메서드를 시작할 때부터 종료할 때까지 모든 로직을 하나의 트랜잭션으로 묶을 수 있다.
+이렇게 되면 MemberRepository와 LogRepository의 save 메서드들이 같은 트랜잭션에 포함된다.
+단순히 하나의 트랜잭션만 존재하는 상황이기 때문에
+논리 트랜잭션, 물리 트랜잭션, 내부 트랜잭션, 외부 트랜잭션, rollbackOnly, 트랜잭션 전파 등의 개념이 전혀 존재하지 않는다.
+그냥 단순하고 깔끔하게 통으로 하나의 트랜잭션으로 보는 거다.
+
+MemberService에만 @Transactional이 붙어 있기 때문에 여기에만 트랜잭션 AOP가 적용된다. (동적 서비스 프록시 객체 생성)
+MemberRepository와 LogRepository에는 트랜잭션 AOP가 적용되지 않는다. 즉, 동적 프록시 객체가 생성되지 않는다.
+MemberService의 시작부터 끝까지 관련 로직들이 해당 트랜잭션의 Connection을 사용한다.
+이는 같은 쓰레드에 포함되는 것이기 때문에 트랜잭션 동기화 매니저에서 같은 Connection을 반환해주기 때문이다.
+
+
+테스트 코드 실행 로그를 살펴보자: 
+== memberRepository 호출 시작 ==
+member 저장
+call next value for hibernate_sequence
+== memberRepository 호출 종료 ==
+== logRepository 호출 시작 ==
+log 저장
+call next value for hibernate_sequence
+== logRepository 호출 종료 ==
+Completing transaction for [springtx.propagation.MemberService.joinV1]
+Initiating transaction commit
+Committing JPA transaction on EntityManager [SessionImpl(273401463<open>)]
+insert into member (username, id) values (?, ?)
+insert into log (message, id) values (?, ?)
+Closing JPA EntityManager [SessionImpl(273401463<open>)] after transaction
+select member0_.id as id1_1_, member0_.username as username2_1_ from member member0_ where member0_.username=?
+select log0_.id as id1_0_, log0_.message as message2_0_ from log log0_ where log0_.message=?
+
+참고로, commit을 한 후에 insert 쿼리가 호출되는데, 이는 JPA의 특징이다. (flush)
+
+
+
+- 트랜잭션 전파/정상 작동하는 경우 (브랜치명: tx-propagation-example3)
+만약 각각 트랜잭션이 필요한 경우가 있으면 어떻게 할까? 예를 들면:
+MemberService를 거치지 않고 MemberRepository만 호출하며 여기에만 트랜잭션을 사용하고 싶을 수도 있고,
+MemberService를 거치지 않고 LogRepository만 호출하며 여기에만 트랜잭션을 사용하고 싶을 수 있다.
+
+만약 트랜잭션 전파 개념이 없었다면 Repository에 @Transactional이 걸린 메서드와 걸리지 않은 메서드 둘 다 만들었어야 했을 것이다.
+    @Transactional
+    public void saveWithTx(Member member) {
+        log.info("member 저장");
+        em.persist(member);
+    }
+
+    public void saveNoTx(Member member) {
+        log.info("member 저장");
+        em.persist(member);
+    }
+이런 식으로 말이다. 이렇게 했으면 정말 비효율적이었을 것이다. 이런 방식은 사용하지 않는다.
+
+
+스프링은 @Transactional이 달려 있으면 기본적으로 REQUIRED 전파 옵션을 사용한다.
+이 옵션은 기존에 트랜잭션이 없으면 트랜잭션을 생성하고, 기존에 트랜잭션이 있으면 기존 트랜잭션에 참여한다.
+기존 트랜잭션에 참여할 경우 해당 트랜잭션을 그대로 따르며, 같은 동기화 Connection을 사용하게 된다.
+
+그래서 이번에는 MemberService는 물론이고 Repository들에도 모두 @Transactional을 적용해본다.
+그리고 나서 이 테스트 코드를 실행해본다.
+    @Test
+    void outerTxON_success() {
+        String username = "outerTxON_success";
+
+        memberService.joinV1(username);
+
+        assertThat(memberRepository.findByUsername(username)).isNotEmpty();
+        assertThat(logRepository.findByMessage(username)).isNotEmpty();
+    }
+
+이 코드에서는 memberService.joinV1() 메서드가 외부 트랜잭션이 되고,
+memberRepository.save()와 logRepository.save() 이 둘은 내부 트랜잭션이 된다.
+총 세 개의 논리 트랜잭션이 생기는 것이며, memberService.joinV1을 메인으로 하는 하나의 물리 트랜잭션 안에 묶여 있다.
+
+이렇게 모든 영역에 @Transactional을 걸어주었기 때문에 MemberService를 통해 save 메서드를 호출해도 트랜잭션을 적용할 수 있고,
+특히 이 경우에는 isNewTransaction이라든지 rollbackOnly, 외부/내부/논리/물리 트랜잭션 등 앞에서 다루었던 전파 개념들이 모두 적용된다.
+한편, 곧바로 Repository에 접근하여 save 메서드를 호출해도 트랜잭션을 적용할 수 있게 되었다.
+
+
+
+- 트랜잭션 전파/롤백하는 경우 (브랜치명: tx-propagation-example3)
+    @Test
+    void outerTxON_fail() {
+        String username = "로그예외_outerTxON_fail";
+
+        assertThatThrownBy(() -> memberService.joinV1(username))
+                .isInstanceOf(RuntimeException.class);
+
+        assertThat(memberRepository.findByUsername(username)).isEmpty();
+        assertThat(logRepository.findByMessage(username)).isEmpty();
+    }
+
+파라미터에 "로그예외"라는 문자열이 포함되어 있으면 LogRepository save 메서드에서 RuntimeException이 터지게 해놨었다.
+그렇기 때문에 이 테스트에서는 RuntimeException이 던져질 것이고, joinV1 메서드 전체가 롤백되기 때문에
+Member와 Log 둘 다 롤백되어 DB에 저장되는 데이터는 없을 것이다. 그렇기 때문에 조회했을 때 isEmpty()가 true여야 한다.
+
+LogRepository에서 예외를 던지면 곧바로 물리 롤백을 호출하지는 않고, 트랜잭션 동기화 매니저를 통해 rollbackOnly를 설정하게 된다.
+LogRepository가 던진 예외는 MemberService가 받게 되며, joinV1에서도 예외를 직접 처리하지 않고 클라이언트로 예외를 던지게 된다.
+MemberService가 물리 트랜잭션을 관리하므로 물리 롤백을 호출한다. 
+
+이렇게, MemberService 하나의 트랜잭션으로 묶은 덕분에
+문제가 발생했을 때 회원과 로그 데이터가 함께 롤백되어 데이터 정합성에 문제가 발생하지 않는다.
+
+
+
+- 트랜잭션 전파: REQUIRED 전파 옵션에서 logRepository.save가 롤백되도 Member만이라도 커밋하려 할 때
+회원 이력 로그를 DB에 남기는 작업에 가끔 문제가 발생했다고 회원 가입까지 안 되면 너무 불편한 거 아니냐는 불만 접수가 들어왔다.
+그래서 회원 이력 로그는 추후에 복구하기로 하고 회원 가입 로그에서 롤백이 발생하더라도 회원 가입은 유지하기로 결정했다.
+그래서 MemberService의 joinV2 메서드를 사용하기로 했다. 당연히 joinV2 앞에 @Transactional을 달아두어야 한다.
+
+    @Transactional
+    public void joinV2(String username) {
+        Member member = new Member(username);
+        Log logMessage = new Log(username);
+
+        log.info("== memberRepository 호출 시작 ==");
+        memberRepository.save(member);
+        log.info("== memberRepository 호출 종료 ==");
+
+        log.info("== logRepository 호출 시작 ==");
+        try {
+            logRepository.save(logMessage);
+        } catch (RuntimeException e) {
+            log.info("log 저장에 실패했습니다. logMessage = {}", logMessage.getMessage());
+            log.info("정상 흐름 변환");
+        }
+        log.info("== logRepository 호출 종료 ==");
+    }
+
+joinV2 메서드는 logRepository에서 RuntimeException이 발생했을 때 이를 catch 하고 안내 로그만 출력하고
+memberRepository.save()는 그대로 진행시키도록 만든 메서드이다.
+
+그러면 다음과 같이 joinV2를 활용하여 테스트를 작성해볼 수 있다:
+    @Test
+    void recoverException_fail() {
+        String username = "로그예외_recoverException_fail";
+
+        memberService.joinV2(username);
+
+        assertThat(memberRepository.findByUsername(username)).isNotEmpty();
+        assertThat(logRepository.findByMessage(username)).isEmpty();
+    }
+
+이 테스트는 통과하지 못한다. 왜냐하면 아무리 RuntimeException을 catch 한다고 한들
+logRepository.save 에서 발생한 RuntimeException에 의해 joinV2 메서드의 트랜잭션은
+트랜잭션 전파로 인해 rollbackOnly = true 상태가 되기 때문에 memberRepository.save도 결국 커밋하지 못하게 된다.
+그렇기 때문에 이 테스트를 통과하기 위해서는 다음의 부분을 수정해야 한다.
+
+    (1)
+    memberService.joinV2(username);
+                                  ---> 아래처럼 수정
+    assertThatThrownBy(() -> memberService.joinV2(username))
+            .isInstanceOf(UnexpectedRollbackException.class);
+
+    (2)
+    assertThat(memberRepository.findByUsername(username)).isNotEmpty();
+                                  ---> 아래처럼 수정
+    assertThat(memberRepository.findByUsername(username)).isEmpty();
+  
+
+흐름을 설명하면 다음과 같다:
+1) logRepository.save 에서 RuntimeException 예외 발생
+
+2) LogRepository의 트랜잭션 AOP가 해당 예외를 받는다.
+
+3) isNewTransation = false 이므로 곧바로 물리 트랜잭션을 롤백하지는 않고 트랜잭션 동기화 매니저를 통해
+   rollbackOnly = true가 되도록 한다.
+
+4) 이후 트랜잭션 AOP는 전달 받은 예외를 밖으로 던져 MemberService가 받게 된다.
+
+5) MemberService의 트랜잭션 AOP가 RuntimeException을 catch 하여 처리한다.
+
+6) 정상흐름으로 돌아오고 MemberService에서 트랜잭션 AOP 커밋을 호출한다.
+   MemberService는 신규트랜잭션이므로, 즉 isNewTransaction = true 이므로
+   실제 물리 트랜잭션을 커밋해야 하며, rollbackOnly를 체크한다.
+   하지만 rollbackOnly가 true로 되어 있기 때문에 커밋되지 못하고 물리 트랜잭션이 롤백되고,
+   트랜잭션 매니저가 UnexpectedRollbackException 예외를 던진다.
+   결과적으로 MemberService의 내부 논리 트랜잭션인 MemberRepository.save 역시 롤백될 수밖에 없다.
+
+
+아무리 MemberService에서 RuntimeException을 catch 하여 처리한다 한들
+이미 logRepository.save에서 예외가 터질 때 트랜잭션 전파 때문에 rollbackOnly = true가 되어 버려서
+물리 트랜잭션 전체가 롤백되어야 하는 운명에 처하게 된다.
+즉, RuntimeException 예외가 전파되는 게 문제의 원인이 아니라 rollbackOnly = ture 가 전파되어 버리는 것이 문제이다.
+
+사실 근본적인 원인은 logRepository.save의 @Transactional의 전파 옵션이 REQUIRED로 설정되어 있기 때문이다.
+사실상 joinV1을 쓰든 joinV2를 쓰든 logRepository.save의 전파 옵션이 REQUIRED인 이상
+MemberService의 물리 트랜잭션으로부터 벗어날 수 없다.
+그러므로 데이터 정합성을 포기하더라도 의도한 대로 MemberRepository.save 만이라도 작동하게 하려면
+전파 옵션을 REQUIRED가 아닌 REQUIRES_NEW를 사용해야 한다.
+
+
+
+- 트랜잭션 전파: REQUIRES_NEW 전파 옵션에서 logRepository.save가 롤백되도 Member만이라도 커밋하려 할 때
+(브랜치명: tx-propagation-example4)
+
+LogRepository.save 메서드의 @Transactional에 propagation = Propagation.REQUIRES_NEW를 설정한다.
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void save(Log logMessage) {
+        log.info("log 저장");
+        em.persist(logMessage);
+
+        if (logMessage.getMessage().contains("로그예외")) {
+            log.info("log 저장 시 예외 발생");
+            throw new RuntimeException("예외 발생");
+        }
+    }
+
+참고로, LogRepository.save에만 REQUIRES_NEW를 적용하는 것이며, MemberRepository.save는 여전히 REQUIRED이다.
+
+
+테스트 코드를 살펴보자:
+
+    @Test
+    void recoverException_success() {
+        String username = "로그예외_recoverException_success";
+
+        memberService.joinV2(username);
+
+        assertThat(memberRepository.findByUsername(username)).isNotEmpty();
+        assertThat(logRepository.findByMessage(username)).isEmpty();
+    }
+
+테스트 코드를 보면 UnexpectedRollbackException을 던지지 않았다.
+REQUIRES_NEW 전파 옵션에서는 MemberService.joinV2와 LogRepository.save는 별개의 물리 트랜잭션에 속한다.
+그렇기 때문에 LogRepository.save에서 예외가 터져도 MemberService의 물리 트랜잭션이 rollbackOnly = true 가 되지 않는다.
+UnexpectedRollbackException 예외는 rollbackOnly = true일 때 커밋을 시도할 때 발생하는 예외인데,
+물리 트랜잭션이 분리된 MemberService는 여전히 rollbackOnly = false라서 UnexpectedRollbackException가 발생하지 않는다.
+그래서 assertThatThrownBy 예외검증 코드가 없고 곧바로 memberService.joinV2(username); 코드를 작성한 것이다.
+
+그리고 joinV2 메서드의 결과 memberRepository.save는 정상 커밋되고 logRepository.save는 롤백되기 때문에
+Optional<Member>는 isNotEmpty()가 true이고, Optional<Log>는 isEmpty()가 true가 된다.
+
+REQUIRES_NEW는 그 이름 그대로 '항상 새로운 트랜잭션'을 만든다. 
+그렇기 때문에 REQUIRES_NEW로 설정한 LogRepository.save에서 사용하는 DB Connection이나 트랜잭션 모두
+MemberService + MemberRepository에서 사용하는 DB Connection과 트랜잭션과 아예 별개이다.
+
+
+동작 흐름은 다음과 같다: 
+1) logRepository.save에서 RuntimeException 예외 발생
+
+2) logRepository.save에 트랜잭션 AOP가 적용되었기 때문에 LogRepository의 프록시 객체가 예외를 받는다.
+
+3) REQUIRES_NEW이기 때문에 isNewTransation() = true이다.
+   이 트랜잭션 자체가 물리 트랜잭션이기 때문에 rollbackOnly 표시를 해줄 전파 트랜잭션도 없다.
+   그래서 물리 트랜잭션이 롤백되고 트랜잭션 종료 및 Connection을 반환한다.
+
+4) 한편, RuntimeException은 트랜잭션 AOP 밖으로 던져진 후 MemberService가 받는다.
+
+5) MemberService는 RuntimeException을 catch 블록에 입력한대로 처리하고 정상적인 흐름으로 복귀한다.
+
+6) 정상 흐름이 되었으므로 MemberService의 트랜잭션 AOP가 커밋을 호출한다.
+
+7) rollbackOnly = false이므로 물리 트랜잭션을 커밋한다. 결과적으로 Member 데이터가 DB에 저장되며, Log는 롤백되어 저장되지 않는다.
+
+
+
+- REQUIRES_NEW 관련한 주의사항
+REQUIRES_NEW를 사용하면 하나의 HTTP 요청(위 예제의 회원가입 요청)에 동시에 여러 개의 DB Connection을 사용하게 된다.
+따라서 성능이 중요한 웹 서비스의 경우 사용에 주의해야 한다.
+만약 REQUIRES_NEW를 사용하지 않고 해결할 방법이 있다면 차라리 그 방법을 선택하는 것이 권장된다.
+
+예를 들면 다음과 같이 구조를 변경하는 방법도 있다:
+현재는 MemberService가 LogRepository의 외부 트랜잭션으로 존재한다.
+물론 REQUIRES_NEW이기 때문에 별개의 트랜잭션이기는 하지만 이러한 구조보다는 차라리
+LogRepository를 MemberService의 바깥으로 빼버려서 완전히 독립적인 트랜잭션으로 만들어버리는 것이다.
+
+MemberFacade  ----->  MemberService  ---->  MemberRepository.save 
+                    ----->  LogRepository.save
+
+이렇게 하면 HTTP 요청에 동시에 2개의 커넥션을 사용하지는 않는다. Connection을 순차적으로 사용하고 반환하게 된다.
+물론 구조상 REQUIRES_NEW를 사용하는 것이 더 깔끔한 경우도 있으므로 장단점을 이해하고 적절하게 선택해서 사용하면 된다.
+
